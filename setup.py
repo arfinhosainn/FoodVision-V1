@@ -1,0 +1,23 @@
+from setuptools import setup, find_packages
+
+setup(
+    name="nutritionist",
+    version="1.0.0",
+    packages=find_packages(),
+    install_requires=[
+        "fastapi==0.109.2",
+        "uvicorn==0.27.1",
+        "python-multipart==0.0.9",
+        "streamlit==1.31.1",
+        "pillow==10.2.0",
+        "google-generativeai==0.3.2",
+        "python-dotenv==1.0.1",
+        "numpy==1.26.4",
+        "opencv-python==4.9.0.80",
+        "pandas==2.2.0",
+        "requests==2.31.0",
+        "pydantic==2.6.1",
+        "python-jose[cryptography]==3.3.0",
+        "pydantic-settings==2.1.0"
+    ],
+) 
