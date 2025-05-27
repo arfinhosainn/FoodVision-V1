@@ -1,4 +1,4 @@
-# The Nutritionist
+# FoodVision-v1
 
 An AI-powered food analysis application that combines computer vision and natural language processing to provide detailed nutritional information from food images.
 
