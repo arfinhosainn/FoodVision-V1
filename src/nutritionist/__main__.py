@@ -7,9 +7,10 @@ def main():
     settings = get_settings()
     port = int(os.environ.get("PORT", settings.PORT))
     uvicorn.run(
-        "nutritionist.api.app:app",
+        "src.nutritionist.api.app:app",
         host="0.0.0.0",  # Bind to all interfaces
         port=port,
+        workers=1,  # Add worker configuration
         reload=False  # Disable reload in production
     )
 
