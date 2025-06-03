@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: foodvision-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.nutritionist
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.18
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: USDA_API_KEY
+        sync: false
+    healthCheckPath: /docs 
