@@ -1,4 +1,4 @@
-#!/Users/arfinhossin/Downloads/TheNutritionist-main/venv/bin/python3
+#!/Users/arfinhossin/Downloads/FoodVision-V1/venv/bin/python3.9
 # -*- coding: utf-8 -*-
 import re
 import sys

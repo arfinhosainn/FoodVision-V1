@@ -8,7 +8,7 @@ from ..models.food import FoodAnalysis, FoodItem, MealAnalysis, DietaryConsidera
 class AIService:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
+        self.model = genai.GenerativeModel('gemini-2.0-flash')
 
     def configure_api_key(self, api_key: str):
         """Configure Gemini API key"""
