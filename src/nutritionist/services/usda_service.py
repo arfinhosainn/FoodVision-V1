@@ -1,4 +1,4 @@
-import requests
+import aiohttp
 from typing import Dict, Optional
 from ..config.settings import Settings
 
@@ -7,7 +7,7 @@ class USDAService:
         self.settings = settings
         self.base_url = "https://api.nal.usda.gov/fdc/v1"
         
-    def get_nutrition_info(self, food_name: str, api_key: str) -> Optional[Dict]:
+    async def get_nutrition_info(self, food_name: str, api_key: str) -> Optional[Dict]:
         """Get nutritional information from USDA Food Database"""
         try:
             # Search for food
@@ -19,10 +19,11 @@ class USDAService:
                 "pageSize": 1
             }
             
-            response = requests.get(search_url, params=params)
-            response.raise_for_status()
+            async with aiohttp.ClientSession() as session:
+                async with session.get(search_url, params=params) as response:
+                    response.raise_for_status()
+                    data = await response.json()
             
-            data = response.json()
             if not data.get('foods'):
                 return None
                 
@@ -52,10 +53,6 @@ class USDAService:
                 "fdc_id": food.get('fdcId'),
                 "nutrients": nutrients
             }
-            
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching USDA data: {str(e)}")
-            return None
         except Exception as e:
-            print(f"Error processing USDA data: {str(e)}")
+            print(f"Error fetching USDA data: {str(e)}")
             return None 

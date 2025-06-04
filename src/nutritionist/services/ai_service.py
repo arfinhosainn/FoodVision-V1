@@ -14,7 +14,7 @@ class AIService:
         """Configure Gemini API key"""
         genai.configure(api_key=api_key)
 
-    def get_food_analysis(
+    async def get_food_analysis(
             self,
             image_parts: List[Dict],
             cv_results: Optional[Dict] = None,
@@ -74,7 +74,7 @@ class AIService:
             """
 
             # Generate response
-            response = self.model.generate_content([enhanced_prompt, *image_parts])
+            response = await self.model.generate_content_async([enhanced_prompt, *image_parts])
 
             # Extract and parse JSON
             try:

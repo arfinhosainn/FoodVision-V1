@@ -3,6 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import io
 from typing import Optional
+import asyncio
+from functools import lru_cache
+import hashlib
 
 from ..config.settings import Settings, get_settings
 from ..services.image_processor import ImageProcessor
@@ -25,6 +28,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Cache for analysis results
+analysis_cache = {}
+
+def get_cache_key(file_contents: bytes, plate_diameter: float, reference_object: Optional[str]) -> str:
+    """Generate cache key for analysis results"""
+    key_data = file_contents + str(plate_diameter).encode() + (reference_object or "").encode()
+    return hashlib.md5(key_data).hexdigest()
 
 # Dependency injection
 def get_image_processor(settings: Settings = Depends(get_settings)) -> ImageProcessor:
@@ -63,25 +74,47 @@ async def analyze_food(
             image = Image.open(io.BytesIO(contents))
         except Exception as e:
             raise HTTPException(status_code=400, detail="Invalid image file")
+        
+        # Check cache
+        cache_key = get_cache_key(contents, plate_diameter_mm, reference_object)
+        if cache_key in analysis_cache:
+            return analysis_cache[cache_key]
             
         # Process image with CV
         cv_results = image_processor.detect_food_items(image, reference_object)
         if not cv_results:
             raise HTTPException(status_code=500, detail="Failed to process image")
             
-        # Get AI analysis
-        analysis = ai_service.get_food_analysis(
-            [{"mime_type": file.content_type, "data": contents}],
-            cv_results=cv_results,
-            nutrient_base_amount=nutrient_base_amount
+        # Get AI analysis and USDA data concurrently
+        ai_task = asyncio.create_task(
+            ai_service.get_food_analysis(
+                [{"mime_type": file.content_type, "data": contents}],
+                cv_results=cv_results,
+                nutrient_base_amount=nutrient_base_amount
+            )
         )
         
+        usda_data = {}
+        if usda_api_key and cv_results.get('food_instances'):
+            usda_tasks = []
+            for item in cv_results['food_instances']:
+                usda_tasks.append(
+                    asyncio.create_task(
+                        usda_service.get_nutrition_info(item['type'], usda_api_key)
+                    )
+                )
+            usda_results = await asyncio.gather(*usda_tasks)
+            usda_data = {item['type']: result for item, result in zip(cv_results['food_instances'], usda_results) if result}
+        
+        # Get AI analysis result
+        analysis = await ai_task
+        
         # Enhance with USDA data if available
-        if usda_api_key and analysis.food_items:
+        if usda_data and analysis.food_items:
             for item in analysis.food_items:
-                usda_data = usda_service.get_nutrition_info(item.name, usda_api_key)
-                if usda_data:
-                    nutrients = usda_data.get('nutrients', {})
+                if item.name in usda_data:
+                    usda_info = usda_data[item.name]
+                    nutrients = usda_info.get('nutrients', {})
                     conversion_factor = nutrient_base_amount / 100.0
                     
                     # Update with USDA values
@@ -91,11 +124,16 @@ async def analyze_food(
                     item.nutrients_per_base.fat = nutrients.get('Total lipid (fat)', {}).get('amount', item.nutrients_per_base.fat) * conversion_factor
                     item.nutrients_per_base.fiber = nutrients.get('Fiber, total dietary', {}).get('amount', item.nutrients_per_base.fiber) * conversion_factor
         
-        return AnalysisResponse(
+        response = AnalysisResponse(
             success=True,
             data=analysis.dict(),
             error=None
         )
+        
+        # Cache the result
+        analysis_cache[cache_key] = response
+        
+        return response
         
     except HTTPException as he:
         raise he

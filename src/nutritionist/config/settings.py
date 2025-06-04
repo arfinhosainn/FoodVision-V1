@@ -17,8 +17,10 @@ class Settings(BaseSettings):
     DEFAULT_NUTRIENT_BASE_AMOUNT: int = 100
     
     # Image processing settings
-    MAX_IMAGE_SIZE: int = 1024  # Maximum dimension for image processing
-    MIN_CONTOUR_AREA: int = 500  # Minimum area for food detection
+    MAX_IMAGE_SIZE: int = 800  # Reduced from 1024 for faster processing
+    MIN_CONTOUR_AREA: int = 300  # Reduced from 500 to detect smaller items
+    ENABLE_ADVANCED_PROCESSING: bool = False  # New flag to control processing level
+    PROCESSING_QUALITY: str = "fast"  # New setting: "fast", "balanced", "quality"
     
     # Server settings
     HOST: str = "0.0.0.0"

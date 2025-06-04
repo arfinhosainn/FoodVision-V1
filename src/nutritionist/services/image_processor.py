@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from ..config.settings import Settings
+import io
 
 class ImageProcessor:
     def __init__(self, settings: Settings):
@@ -15,29 +16,45 @@ class ImageProcessor:
         }
 
     def preprocess_image(self, image: Image.Image) -> Dict:
-        """Enhanced image preprocessing with Gaussian blur, contrast enhancement, and edge detection"""
+        """Enhanced image preprocessing with configurable quality settings"""
         try:
             # Convert PIL Image to OpenCV format
             img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
             
+            # Automatic image compression
+            img_cv = self._compress_image(img_cv)
+            
             # Basic preprocessing
-            blurred = cv2.GaussianBlur(img_cv, (5, 5), 0)
-            lab = cv2.cvtColor(blurred, cv2.COLOR_BGR2LAB)
-            l, a, b = cv2.split(lab)
-            
-            # Apply CLAHE
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            enhanced_l = clahe.apply(l)
-            enhanced_lab = cv2.merge([enhanced_l, a, b])
-            enhanced = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
-            
-            # Edge detection
-            gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
-            sigma = 0.33
-            median = np.median(gray)
-            lower = int(max(0, (1.0 - sigma) * median))
-            upper = int(min(255, (1.0 + sigma) * median))
-            edges = cv2.Canny(gray, lower, upper)
+            if self.settings.PROCESSING_QUALITY == "fast":
+                # Fast processing: just convert to grayscale
+                gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+                edges = cv2.Canny(gray, 50, 150)
+                
+            elif self.settings.PROCESSING_QUALITY == "balanced":
+                # Balanced processing: moderate enhancement
+                lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                enhanced_l = clahe.apply(l)
+                enhanced_lab = cv2.merge([enhanced_l, a, b])
+                enhanced = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+                gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+                edges = cv2.Canny(gray, 50, 150)
+                
+            else:  # quality mode
+                # Full quality processing
+                lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                enhanced_l = clahe.apply(l)
+                enhanced_lab = cv2.merge([enhanced_l, a, b])
+                enhanced = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+                gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+                sigma = 0.33
+                median = np.median(gray)
+                lower = int(max(0, (1.0 - sigma) * median))
+                upper = int(min(255, (1.0 + sigma) * median))
+                edges = cv2.Canny(gray, lower, upper)
             
             # Clean up edges
             kernel = np.ones((3,3), np.uint8)
@@ -46,13 +63,55 @@ class ImageProcessor:
             
             return {
                 'original': img_cv,
-                'enhanced': enhanced,
+                'enhanced': enhanced if self.settings.PROCESSING_QUALITY != "fast" else img_cv,
                 'edges': cleaned_edges,
                 'dilated': dilated,
                 'gray': gray
             }
         except Exception as e:
             raise ValueError(f"Error in image preprocessing: {str(e)}")
+
+    def _compress_image(self, img: np.ndarray) -> np.ndarray:
+        """Automatically compress image while maintaining quality"""
+        # Get current image dimensions
+        height, width = img.shape[:2]
+        
+        # Calculate target size while maintaining aspect ratio
+        max_dimension = self.settings.MAX_IMAGE_SIZE
+        scale = min(max_dimension / width, max_dimension / height)
+        
+        if scale < 1:  # Only resize if image is larger than max dimension
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            
+            # Resize image
+            img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            
+            # Calculate compression quality based on image size
+            if self.settings.PROCESSING_QUALITY == "fast":
+                quality = 85
+            elif self.settings.PROCESSING_QUALITY == "balanced":
+                quality = 90
+            else:  # quality mode
+                quality = 95
+                
+            # Convert to PIL Image for compression
+            pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            
+            # Create a BytesIO object to store the compressed image
+            buffer = io.BytesIO()
+            
+            # Save with compression
+            pil_img.save(buffer, format='JPEG', quality=quality, optimize=True)
+            
+            # Read back the compressed image
+            buffer.seek(0)
+            compressed_img = Image.open(buffer)
+            
+            # Convert back to OpenCV format
+            img = cv2.cvtColor(np.array(compressed_img), cv2.COLOR_RGB2BGR)
+        
+        return img
 
     def detect_food_items(self, image: Image.Image, reference_object: Optional[str] = None) -> Dict:
         """Detect and analyze food items in the image"""
@@ -82,24 +141,32 @@ class ImageProcessor:
         }
 
     def _watershed_segmentation(self, preprocessed: Dict) -> Tuple[np.ndarray, np.ndarray]:
-        """Perform watershed segmentation"""
+        """Perform watershed segmentation with quality-based optimization"""
         edges = preprocessed['edges']
         img = preprocessed['enhanced']
         
-        _, edges_binary = cv2.threshold(edges, 127, 255, cv2.THRESH_BINARY)
-        kernel = np.ones((3,3), np.uint8)
-        sure_bg = cv2.dilate(edges_binary, kernel, iterations=3)
+        if self.settings.PROCESSING_QUALITY == "fast":
+            # Simplified segmentation for fast processing
+            _, edges_binary = cv2.threshold(edges, 127, 255, cv2.THRESH_BINARY)
+            kernel = np.ones((3,3), np.uint8)
+            sure_bg = cv2.dilate(edges_binary, kernel, iterations=2)
+            markers = cv2.connectedComponents(sure_bg)[1]
+            markers = markers + 1
+            markers[edges_binary == 255] = 0
+        else:
+            # Full watershed segmentation
+            _, edges_binary = cv2.threshold(edges, 127, 255, cv2.THRESH_BINARY)
+            kernel = np.ones((3,3), np.uint8)
+            sure_bg = cv2.dilate(edges_binary, kernel, iterations=3)
+            dist_transform = cv2.distanceTransform(edges_binary, cv2.DIST_L2, 5)
+            _, sure_fg = cv2.threshold(dist_transform, 0.5*dist_transform.max(), 255, 0)
+            sure_fg = np.uint8(sure_fg)
+            unknown = cv2.subtract(sure_bg, sure_fg)
+            _, markers = cv2.connectedComponents(sure_fg)
+            markers = markers + 1
+            markers[unknown == 255] = 0
+            markers = cv2.watershed(img, markers)
         
-        dist_transform = cv2.distanceTransform(edges_binary, cv2.DIST_L2, 5)
-        _, sure_fg = cv2.threshold(dist_transform, 0.5*dist_transform.max(), 255, 0)
-        sure_fg = np.uint8(sure_fg)
-        
-        unknown = cv2.subtract(sure_bg, sure_fg)
-        _, markers = cv2.connectedComponents(sure_fg)
-        markers = markers + 1
-        markers[unknown == 255] = 0
-        
-        markers = cv2.watershed(img, markers)
         segmented = img.copy()
         segmented[markers == -1] = [0, 0, 255]
         
