@@ -1,4 +1,9 @@
 services:
+  - type: redis
+    name: nutrition-cache
+    plan: free        # starter for persistence, free for dev
+    maxmemoryPolicy: allkeys-lru
+
   - type: web
     name: foodvision-api
     env: python
@@ -15,4 +20,9 @@ services:
         sync: false
       - key: PORT
         value: 8000
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: nutrition-cache
+          property: connectionString
     healthCheckPath: /docs 
