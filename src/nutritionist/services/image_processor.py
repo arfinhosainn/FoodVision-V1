@@ -5,15 +5,156 @@ from typing import Dict, List, Optional, Tuple
 from ..config.settings import Settings
 import io
 
+# Optional YOLO import (lazy)
+try:
+    from ultralytics import YOLO  # type: ignore
+except Exception:
+    YOLO = None
+
+# ------------------------------------------------------------------
+# Ensure PyTorch safe serializer recognises Ultralytics classes *before*
+# any model weights are loaded (multiprocess workers, no reload).
+# ------------------------------------------------------------------
+try:
+    import torch.serialization as _ts  # type: ignore
+    from ultralytics.nn.tasks import DetectionModel  # type: ignore
+    from torch.nn.modules.container import Sequential  # type: ignore
+    from ultralytics.nn.modules import Conv  # type: ignore
+    if hasattr(_ts, "add_safe_globals"):
+        # torch.serialization.add_safe_globals expects a *dict* that maps the fully
+        # qualified name to the object. Passing a list (what we did before) is a
+        # no-op, so YOLO kept failing on every new class that appeared in the
+        # checkpoint. Register the needed classes properly so the weight file
+        # loads once and stays in memory.
+        _safe_dict = {
+            f"{cls.__module__}.{cls.__qualname__}": cls for cls in (DetectionModel, Sequential, Conv)
+        }
+        _ts.add_safe_globals(_safe_dict)
+except Exception:
+    # If torch is missing or API changed we silently continue – loader will fallback.
+    pass
+
+# Optional Mask R-CNN import (torchvision)
+try:
+    import torch  # type: ignore
+    from torchvision import models as tv_models, transforms as tv_transforms  # type: ignore
+except Exception:
+    torch = None
+    tv_models = None
+
+# Optional ONNX Runtime (for accelerated inference)
+try:
+    import onnxruntime as ort  # type: ignore
+except Exception:
+    ort = None
+
+# Optional MiDaS depth-estimation via torch.hub
+# We will lazy-load to avoid long startup times.
+try:
+    import torch  # type: ignore  # re-use if already imported
+except Exception:
+    torch = None
+
 class ImageProcessor:
     def __init__(self, settings: Settings):
         self.settings = settings
+
+        # ------------------------------------------------------------
+        # YOLO initialisation (PyTorch or ONNX depending on settings)
+        # ------------------------------------------------------------
+        self._yolo_model = None
+        if self.settings.USE_YOLO_DETECTION and YOLO is not None:
+            try:
+                # Decide which model path to load
+                model_path = (
+                    self.settings.YOLO_ONNX_MODEL
+                    if self.settings.USE_ONNX_ACCELERATION
+                    else self.settings.YOLO_MODEL
+                )
+
+                if not self.settings.USE_ONNX_ACCELERATION:
+                    # Allow ultralytics DetectionModel class in torch safe loader (PyTorch>=2.6)
+                    try:
+                        import torch.serialization as _ts  # type: ignore
+                        from ultralytics.nn.tasks import DetectionModel  # type: ignore
+                        from torch.nn.modules.container import Sequential  # type: ignore
+                        from ultralytics.nn.modules import Conv  # type: ignore
+                        if hasattr(_ts, "add_safe_globals"):
+                            _ts.add_safe_globals({
+                                "ultralytics.nn.tasks.DetectionModel": DetectionModel,
+                                "torch.nn.modules.container.Sequential": Sequential,
+                                "ultralytics.nn.modules.Conv": Conv,
+                            })  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+
+                # Loading via ultralytics automatically chooses backend based on extension
+                self._yolo_model = YOLO(model_path)
+            except Exception as e:
+                # Disable YOLO on failure but keep server running
+                self.settings.USE_YOLO_DETECTION = False
+                print(f"[WARN] Failed to load YOLO model: {e}. Falling back to OpenCV pipeline.")
+
+        # ------------------------------------------------------------
+        # Mask R-CNN initialisation (Torch or ONNX)
+        # ------------------------------------------------------------
+        self._mask_model = None  # torch version
+        self._mask_session = None  # onnxruntime session
+
+        if self.settings.USE_MASK_RCNN:
+            # First preference: ONNX acceleration if requested and runtime present
+            if self.settings.USE_ONNX_ACCELERATION and ort is not None:
+                try:
+                    providers = ort.get_available_providers()
+                    self._mask_session = ort.InferenceSession(
+                        self.settings.MASK_RCNN_ONNX_MODEL, providers=providers
+                    )
+                except Exception as e:
+                    print(f"[WARN] Failed to load ONNX Mask R-CNN: {e}. Falling back to Torch model.")
+
+            # If ONNX not used / failed, fall back to TorchVision model
+            if self._mask_session is None and tv_models is not None:
+                try:
+                    self._mask_model = tv_models.detection.maskrcnn_resnet50_fpn(weights="DEFAULT")
+                    self._mask_model.eval()
+                    if torch and torch.cuda.is_available():
+                        self._mask_model.to("cuda")
+                    self._mask_tf = tv_transforms.Compose([tv_transforms.ToTensor()])
+                except Exception as e:
+                    self.settings.USE_MASK_RCNN = False
+                    print(f"[WARN] Failed to load Torch Mask R-CNN: {e}.")
+
         self.reference_sizes = {
             "Credit Card": {"width": 85.60, "height": 53.98},
             "Quarter (US)": {"diameter": 24.26},
             "Standard Plate": {"diameter": 250},
             "iPhone": {"width": 71.5, "height": 146.7}
         }
+
+        # ------------------------------------------------------------
+        # MiDaS depth-estimation initialisation (lazy)
+        # ------------------------------------------------------------
+        self._depth_model = None
+        self._depth_tf = None
+        if self.settings.USE_MIDAS_DEPTH and torch is not None:
+            try:
+                # Download/load model using torch.hub
+                self._depth_model = torch.hub.load("intel-isl/MiDaS", self.settings.MIDAS_MODEL_NAME)
+                self._depth_model.eval()
+
+                midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+                if self.settings.MIDAS_MODEL_NAME.lower() == "midas_small":
+                    self._depth_tf = midas_transforms.small_transform
+                elif "dpt" in self.settings.MIDAS_MODEL_NAME.lower():
+                    self._depth_tf = midas_transforms.dpt_transform
+                else:
+                    self._depth_tf = midas_transforms.default_transform
+
+                if torch.cuda.is_available():
+                    self._depth_model.to("cuda")
+            except Exception as e:
+                self.settings.USE_MIDAS_DEPTH = False
+                print(f"[WARN] Failed to load MiDaS model: {e}. Depth estimation disabled.")
 
     def preprocess_image(self, image: Image.Image) -> Dict:
         """Enhanced image preprocessing with configurable quality settings"""
@@ -115,6 +256,74 @@ class ImageProcessor:
 
     def detect_food_items(self, image: Image.Image, reference_object: Optional[str] = None) -> Dict:
         """Detect and analyze food items in the image"""
+
+        # If YOLO enabled and model loaded, run it first
+        if self.settings.USE_YOLO_DETECTION and self._yolo_model is not None:
+            try:
+                results = self._yolo_model.predict(np.array(image))
+                food_instances = self._yolo_results_to_instances(results)
+                return {
+                    'food_instances': food_instances,
+                    'visualization': image,
+                    'calibration': None,
+                    'preprocessed': None
+                }
+            except Exception as e:
+                print(f"[WARN] YOLO detection failed: {e}. Falling back to OpenCV pipeline.")
+
+        # If Mask R-CNN enabled (without YOLO) run segmentation-only pipeline
+        if self.settings.USE_MASK_RCNN and (
+            self._mask_session is not None or self._mask_model is not None
+        ):
+            # Branch 1: ONNX Runtime inference
+            if self._mask_session is not None:
+                try:
+                    # Pre-process image to tensor shape (1,3,H,W) with float32 pixel values 0-1
+                    img_np = np.array(image.convert("RGB"), dtype=np.float32) / 255.0
+                    img_np = np.transpose(img_np, (2, 0, 1))  # CHW
+                    img_np = np.expand_dims(img_np, 0)
+
+                    ort_inputs = {self._mask_session.get_inputs()[0].name: img_np}
+                    ort_outs = self._mask_session.run(None, ort_inputs)
+
+                    # Simple parsing – assume torchvision style outputs order
+                    # [boxes, labels, scores, masks]
+                    if len(ort_outs) >= 4:
+                        outputs = {
+                            "boxes": ort_outs[0],
+                            "labels": ort_outs[1],
+                            "scores": ort_outs[2],
+                            "masks": ort_outs[3],
+                        }
+                        instances = self._mask_results_to_instances(outputs)
+                        return {
+                            'food_instances': instances,
+                            'visualization': image,
+                            'calibration': None,
+                            'preprocessed': None
+                        }
+                except Exception as e:
+                    print(f"[WARN] ONNX Mask R-CNN failed: {e}. Falling back to Torch/CPU pipeline.")
+
+            # Branch 2: TorchVision Mask R-CNN
+            if self._mask_model is not None:
+                try:
+                    with torch.no_grad():  # type: ignore[attr-defined]
+                        img_tensor = self._mask_tf(image)
+                        if torch and torch.cuda.is_available():
+                            img_tensor = img_tensor.to("cuda")
+                        outputs = self._mask_model([img_tensor])[0]
+                    instances = self._mask_results_to_instances(outputs)
+                    return {
+                        'food_instances': instances,
+                        'visualization': image,
+                        'calibration': None,
+                        'preprocessed': None
+                    }
+                except Exception as e:
+                    print(f"[WARN] Mask R-CNN failed: {e}. Falling back to OpenCV pipeline.")
+
+        # OpenCV fallback pipeline
         preprocessed = self.preprocess_image(image)
         if not preprocessed:
             return None
@@ -284,8 +493,11 @@ class ImageProcessor:
         
         volume_cm3 = None
         if calibration:
-            estimated_height_mm = {'Meat': 20, 'Vegetables': 15, 'Grains': 10}.get(food_type, 15)
-            volume_cm3 = self._estimate_volume(contour, estimated_height_mm, calibration['pixel_to_mm'])
+            if self.settings.USE_MIDAS_DEPTH and self._depth_model is not None:
+                volume_cm3 = self._estimate_volume_midas(roi, contour, calibration['pixel_to_mm'])
+            if volume_cm3 is None:
+                estimated_height_mm = {'Meat': 20, 'Vegetables': 15, 'Grains': 10}.get(food_type, 15)
+                volume_cm3 = self._estimate_volume(contour, estimated_height_mm, calibration['pixel_to_mm'])
         
         return {
             'type': food_type,
@@ -296,6 +508,60 @@ class ImageProcessor:
             'volume_cm3': volume_cm3,
             'confidence': self._calculate_confidence(food_type, solidity)
         }
+
+    # ------------------------------------------------------------
+    # Depth-based volume estimation helpers
+    # ------------------------------------------------------------
+
+    def _compute_depth_map(self, img_rgb: np.ndarray) -> Optional[np.ndarray]:
+        """Return a depth map (H×W) using the MiDaS model; values are arbitrary units."""
+        if not self.settings.USE_MIDAS_DEPTH or self._depth_model is None or self._depth_tf is None or torch is None:
+            return None
+        try:
+            input_batch = self._depth_tf(Image.fromarray(img_rgb)).unsqueeze(0)
+            if torch.cuda.is_available():
+                input_batch = input_batch.to("cuda")
+            with torch.no_grad():  # type: ignore[attr-defined]
+                prediction = self._depth_model(input_batch)
+                prediction = torch.nn.functional.interpolate(
+                    prediction.unsqueeze(1),
+                    size=img_rgb.shape[:2],
+                    mode="bicubic",
+                    align_corners=False,
+                ).squeeze()
+                depth_map = prediction.cpu().numpy()
+                return depth_map
+        except Exception as e:
+            print(f"[WARN] Depth inference failed: {e}")
+            return None
+
+    def _estimate_volume_midas(self, roi_bgr: np.ndarray, contour: np.ndarray, pixel_to_mm: float) -> Optional[float]:
+        """Estimate volume using MiDaS depth predictions over the ROI."""
+        depth_map = self._compute_depth_map(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB))
+        if depth_map is None:
+            return None
+
+        # Create mask of contour within ROI
+        mask = np.zeros(roi_bgr.shape[:2], dtype=np.uint8)
+        # Shift contour coords to ROI local
+        x_off, y_off, _, _ = cv2.boundingRect(contour)
+        shifted_contour = contour.copy()
+        shifted_contour[:, 0, 0] -= x_off
+        shifted_contour[:, 0, 1] -= y_off
+        cv2.drawContours(mask, [shifted_contour], -1, 255, -1)
+
+        depths = depth_map[mask == 255]
+        if depths.size == 0:
+            return None
+        median_depth = float(np.median(depths))  # type: ignore[arg-type]
+
+        # Heuristic: convert relative depth to approximate mm using scaling constant
+        depth_mm = max(median_depth, 1e-3) * 10  # scale factor
+
+        area_pixels = cv2.contourArea(contour)
+        area_mm2 = area_pixels * (pixel_to_mm ** 2)
+        volume_mm3 = area_mm2 * depth_mm
+        return volume_mm3 / 1000.0  # cm^3
 
     def _determine_food_type(self, roi_hsv: np.ndarray, food_type_ranges: Dict) -> str:
         """Determine food type based on color analysis"""
@@ -349,3 +615,51 @@ class ImageProcessor:
             cv2.drawContours(result, [calibration['reference_contour']], -1, (255, 255, 255), 2)
         
         return result 
+
+    # ---------------- YOLO helper ----------------------
+    def _yolo_results_to_instances(self, results) -> List[Dict]:
+        """Convert ultralytics Results object to our food_instances schema."""
+        instances: List[Dict] = []
+        if not results:
+            return instances
+        res = results[0]
+        names = res.names  # class id to name
+        for box in res.boxes:
+            cls_id = int(box.cls[0])
+            cls_name = names.get(cls_id, 'food')
+            xyxy = box.xyxy[0].cpu().numpy()
+            conf = float(box.conf[0])
+            instances.append({
+                'type': cls_name,
+                'bbox': xyxy.tolist(),
+                'confidence': conf,
+                'volume_cm3': None  # will require depth estimation later
+            })
+        return instances 
+
+    def _mask_results_to_instances(self, outputs) -> List[Dict]:
+        instances: List[Dict] = []
+        if outputs is None:
+            return instances
+        def to_numpy(arr):
+            if hasattr(arr, 'cpu'):
+                return arr.cpu().numpy()
+            return np.array(arr)
+
+        scores = to_numpy(outputs['scores'])
+        labels = to_numpy(outputs['labels'])
+        boxes = to_numpy(outputs['boxes'])
+        masks = to_numpy(outputs['masks']) if 'masks' in outputs else None
+        for i, score in enumerate(scores):
+            if score < self.settings.MASK_RCNN_MIN_SCORE:
+                continue
+            label_id = int(labels[i])
+            cls_name = f'class_{label_id}'
+            instances.append({
+                'type': cls_name,
+                'bbox': boxes[i].tolist(),
+                'confidence': float(score),
+                'mask': masks[i][0].tolist() if masks is not None else None,
+                'volume_cm3': None
+            })
+        return instances 

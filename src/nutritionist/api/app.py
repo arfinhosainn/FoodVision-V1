@@ -2,15 +2,18 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import io
-from typing import Optional
+from typing import Optional, Any, Dict, cast
 import asyncio
 from functools import lru_cache
 import hashlib
+from numbers import Number
+import json
 
 from ..config.settings import Settings, get_settings
 from ..services.image_processor import ImageProcessor
-from ..services.ai_service import AIService
-from ..services.usda_service import USDAService
+from ..services.enhanced_ai_service import EnhancedAIService as AIService
+# Nutrition sources
+from ..services.multi_source_nutrition import MultiSourceNutritionService
 from ..models.food import AnalysisResponse
 
 # Create FastAPI app
@@ -29,8 +32,67 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cache for analysis results
-analysis_cache = {}
+# Optional Redis cache (graceful fallback if module or server missing)
+try:
+    import redis.asyncio as redis_async  # type: ignore
+
+    class _RedisCacheWrapper:
+        def __init__(self, url: str):
+            try:
+                self.client = redis_async.from_url(url, encoding=None, decode_responses=True)
+            except Exception as conn_err:
+                print(f"[WARN] Redis connection failed: {conn_err}. Using no-op cache.")
+                self.client = None
+
+        async def get(self, key: str):
+            if self.client:
+                try:
+                    return await self.client.get(key)
+                except Exception as e:
+                    print(f"[WARN] Redis GET failed: {e}")
+            return None
+
+        async def set(self, key: str, value: str, ex: int):
+            if self.client:
+                try:
+                    await self.client.set(key, value, ex=ex)
+                except Exception as e:
+                    print(f"[WARN] Redis SET failed: {e}")
+
+    _HAS_REDIS = True
+except ModuleNotFoundError:
+    # Redis package not installed – fall back to dummy async cache
+    print("[INFO] redis-py not installed – caching disabled.")
+
+    class _RedisCacheWrapper:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def get(self, *_args, **_kwargs):
+            return None
+
+        async def set(self, *_args, **_kwargs):
+            return None
+
+    _HAS_REDIS = False
+
+# Redis cache setup (may be no-op wrapper)
+_settings = get_settings()
+redis_client = _RedisCacheWrapper(_settings.REDIS_URL)
+CACHE_TTL_SECONDS = 3600  # 1 hour TTL
+
+# ------------------------------------------------------------------
+# Utility: round all float values in nested dict/list structures to 2 decimals
+
+def _round_floats(obj):
+    """Recursively round all float values to 2 decimal places."""
+    if isinstance(obj, float):
+        return round(obj, 2)
+    if isinstance(obj, list):
+        return [_round_floats(i) for i in obj]
+    if isinstance(obj, dict):
+        return {k: _round_floats(v) for k, v in obj.items()}
+    return obj
 
 def get_cache_key(file_contents: bytes, plate_diameter: float, reference_object: Optional[str]) -> str:
     """Generate cache key for analysis results"""
@@ -44,20 +106,20 @@ def get_image_processor(settings: Settings = Depends(get_settings)) -> ImageProc
 def get_ai_service(settings: Settings = Depends(get_settings)) -> AIService:
     return AIService(settings)
 
-def get_usda_service(settings: Settings = Depends(get_settings)) -> USDAService:
-    return USDAService(settings)
+def get_nutrition_service(settings: Settings = Depends(get_settings)) -> MultiSourceNutritionService:
+    return MultiSourceNutritionService(settings)
 
 @app.post("/analyze-food", response_model=AnalysisResponse)
 async def analyze_food(
     file: UploadFile = File(...),
     gemini_api_key: str = Form(...),
-    usda_api_key: Optional[str] = Form(None),
-    plate_diameter_mm: Optional[float] = Form(250.0),
+    usda_api_key: Optional[str] = Form(None),  # deprecated; kept for backward compatibility
+    plate_diameter_mm: float = Form(250.0),
     reference_object: Optional[str] = Form(None),
-    nutrient_base_amount: Optional[int] = Form(100),
+    nutrient_base_amount: int = Form(100),
     image_processor: ImageProcessor = Depends(get_image_processor),
     ai_service: AIService = Depends(get_ai_service),
-    usda_service: USDAService = Depends(get_usda_service),
+    nutrition_service: MultiSourceNutritionService = Depends(get_nutrition_service),
     settings: Settings = Depends(get_settings)
 ):
     """Analyze food image and provide nutritional information"""
@@ -75,10 +137,21 @@ async def analyze_food(
         except Exception as e:
             raise HTTPException(status_code=400, detail="Invalid image file")
         
-        # Check cache
+        # Check Redis cache
         cache_key = get_cache_key(contents, plate_diameter_mm, reference_object)
-        if cache_key in analysis_cache:
-            return analysis_cache[cache_key]
+        cached_payload = None
+        try:
+            cached_payload = await redis_client.get(cache_key)
+        except Exception as redis_err:
+            # Redis not reachable – gracefully degrade to no-cache
+            print(f"[WARN] Redis unavailable: {redis_err}. Proceeding without cache.")
+
+        if cached_payload:
+            try:
+                return AnalysisResponse.model_validate_json(cached_payload)
+            except Exception:
+                # If parsing fails, ignore cache and proceed
+                pass
             
         # Process image with CV
         cv_results = image_processor.detect_food_items(image, reference_object)
@@ -94,27 +167,22 @@ async def analyze_food(
             )
         )
         
-        usda_data = {}
-        if usda_api_key and cv_results.get('food_instances'):
-            usda_tasks = []
-            for item in cv_results['food_instances']:
-                usda_tasks.append(
-                    asyncio.create_task(
-                        usda_service.get_nutrition_info(item['type'], usda_api_key)
-                    )
-                )
-            usda_results = await asyncio.gather(*usda_tasks)
-            usda_data = {item['type']: result for item, result in zip(cv_results['food_instances'], usda_results) if result}
+        merged_data = {}
+        if cv_results.get('food_instances'):
+            tasks = [asyncio.create_task(nutrition_service.get_nutrition_info(item['type']))
+                     for item in cv_results['food_instances']]
+            results = await asyncio.gather(*tasks)
+            merged_data = {item['type']: res for item, res in zip(cv_results['food_instances'], results) if res}
         
         # Get AI analysis result
         analysis = await ai_task
         
         # Enhance with USDA data if available
-        if usda_data and analysis.food_items:
+        if merged_data and analysis.food_items:
             for item in analysis.food_items:
-                if item.name in usda_data:
-                    usda_info = usda_data[item.name]
-                    nutrients = usda_info.get('nutrients', {})
+                if item.name in merged_data:
+                    merged_info = merged_data[item.name]
+                    nutrients = merged_info.get('nutrients', {})
                     conversion_factor = nutrient_base_amount / 100.0
                     
                     # Update with USDA values
@@ -124,14 +192,19 @@ async def analyze_food(
                     item.nutrients_per_base.fat = nutrients.get('Total lipid (fat)', {}).get('amount', item.nutrients_per_base.fat) * conversion_factor
                     item.nutrients_per_base.fiber = nutrients.get('Fiber, total dietary', {}).get('amount', item.nutrients_per_base.fiber) * conversion_factor
         
+        rounded_data = cast(Dict[str, Any], _round_floats(analysis.dict()))
+
         response = AnalysisResponse(
             success=True,
-            data=analysis.dict(),
+            data=rounded_data,
             error=None
         )
         
-        # Cache the result
-        analysis_cache[cache_key] = response
+        # Cache response in Redis
+        try:
+            await redis_client.set(cache_key, response.json(), ex=CACHE_TTL_SECONDS)
+        except Exception as e:
+            print(f"[WARN] Failed to cache analysis result to Redis: {e}")
         
         return response
         
