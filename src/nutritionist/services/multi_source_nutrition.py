@@ -1,4 +1,5 @@
 import aiohttp
+import asyncio
 from typing import Dict, Optional
 
 from ..config.settings import Settings
@@ -26,7 +27,9 @@ class MultiSourceNutritionService:
         if not tasks:
             return None
 
-        results = await aiohttp.asyncio.gather(*tasks, return_exceptions=True)  # type: ignore[attr-defined]
+        # Gather results concurrently using the standard asyncio helper—not a non-existent
+        # `aiohttp.asyncio` sub-module (which caused the 'aiohttp has no attribute asyncio' error).
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         # Filter valid dicts
         valid = [r for r in results if isinstance(r, dict) and r.get("nutrients")]
         if not valid:
