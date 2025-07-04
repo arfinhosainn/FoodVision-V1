@@ -40,6 +40,9 @@ try:
         def __init__(self, url: str):
             try:
                 self.client = redis_async.from_url(url, encoding=None, decode_responses=True)
+                # Test connection with a ping to fail fast and log success.
+                asyncio.get_event_loop().run_until_complete(self.client.ping())  # type: ignore[arg-type]
+                print(f"[INFO] Connected to Redis cache at {url.split('@')[-1]}")
             except Exception as conn_err:
                 print(f"[WARN] Redis connection failed: {conn_err}. Using no-op cache.")
                 self.client = None
@@ -64,7 +67,7 @@ except ModuleNotFoundError:
     # Redis package not installed – fall back to dummy async cache
     print("[INFO] redis-py not installed – caching disabled.")
 
-    class _RedisCacheWrapper:  # type: ignore
+    class _NoOpCacheWrapper:  # type: ignore
         def __init__(self, *args, **kwargs):
             pass
 
@@ -78,7 +81,7 @@ except ModuleNotFoundError:
 
 # Redis cache setup (may be no-op wrapper)
 _settings = get_settings()
-redis_client = _RedisCacheWrapper(_settings.REDIS_URL)
+redis_client = _RedisCacheWrapper(_settings.REDIS_URL) if _HAS_REDIS else _NoOpCacheWrapper()
 CACHE_TTL_SECONDS = 3600  # 1 hour TTL
 
 # ------------------------------------------------------------------
