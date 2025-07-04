@@ -40,9 +40,25 @@ try:
         def __init__(self, url: str):
             try:
                 self.client = redis_async.from_url(url, encoding="utf-8", decode_responses=True)
-                # Test connection with a ping to fail fast and log success.
-                asyncio.get_event_loop().run_until_complete(self.client.ping())  # type: ignore[arg-type]
-                print(f"[INFO] Connected to Redis cache at {url.split('@')[-1]}")
+
+                # Test connection with a ping.  When this code executes inside an already
+                # running event loop (e.g. during Uvicorn startup), calling
+                # run_until_complete() would raise 'This event loop is already running'.
+                # Detect that scenario and schedule an async ping instead.
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Schedule ping without waiting; log success once done.
+                    async def _ping():
+                        try:
+                            await self.client.ping()  # type: ignore[arg-type]
+                            print(f"[INFO] Connected to Redis cache at {url.split('@')[-1]}")
+                        except Exception as e:
+                            print(f"[WARN] Redis ping failed after connect: {e}")
+
+                    loop.create_task(_ping())
+                else:
+                    loop.run_until_complete(self.client.ping())  # type: ignore[arg-type]
+                    print(f"[INFO] Connected to Redis cache at {url.split('@')[-1]}")
             except Exception as conn_err:
                 print(f"[WARN] Redis connection failed: {conn_err}. Using no-op cache.")
                 self.client = None
