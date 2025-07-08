@@ -87,3 +87,33 @@ See the API documentation at `http://localhost:8000/docs` for more details.
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Deploying on Fly.io
+
+Fly.io gives you an always-on micro-VM that avoids cold-starts. Once you've installed the Fly CLI (`brew install flyctl` on macOS):
+
+```bash
+# 1) Launch – this creates the app and writes a "fly.toml" (we committed a starter one)
+flyctl launch --dockerfile Dockerfile --name foodvision-api --region ord --now
+
+# 2) Add secrets (replace with your real keys)
+flyctl secrets set GEMINI_API_KEY=xxxxx USDA_API_KEY=yyyy NUTRITIONIX_APP_ID=zzz NUTRITIONIX_APP_KEY=kkkk
+
+# 3) (Optional) Use free Upstash Redis rather than localhost
+flyctl secrets set REDIS_URL="redis://:<password>@<subdomain>.upstash.io:6379"
+
+# 4) Subsequent updates
+flyctl deploy
+```
+
+Things worth knowing:
+
+* The Dockerfile already exposes `PORT 8000`; Fly automatically maps it to ports 80/443 outside.
+* The free allocation (3 × shared-cpu-1x VMs, 256 MB each) is enough for CPU-only YOLOv8n if you disable CUDA and quantize weights.
+* If you need more RAM (`torch + ultralytics` can reach ~300–350 MB resident) switch the VM size:
+  ```bash
+  flyctl scale memory 512      # 512 MB, $2.41/mo when running 24 × 7
+  flyctl scale vm shared-cpu-1x # cheapest CPU class
+  ```
+* Logs in real time: `flyctl logs -a foodvision-api`.
+* Add Postgres / Redis with `flyctl postgres create` or Upstash.
