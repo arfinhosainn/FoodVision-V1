@@ -3,7 +3,7 @@
 # Rename the `app` value after `flyctl launch` generates
 # a globally-unique application name.
 # -------------------------------------------------
-app = "foodvision-api"  # <-- flyctl will rewrite if this name is taken
+app = "foodvision-v1"
 
 # Build section – Fly will build directly from the existing Dockerfile
 [build]
