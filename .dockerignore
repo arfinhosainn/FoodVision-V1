@@ -1,0 +1,29 @@
+**.git
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+# Model checkpoints—download them at runtime or mount volumes instead
+*.pt
+*.onnx
+
+# Media & data
+images/
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+# Local config & secrets
+.env
+
+# VS Code, PyCharm, etc.
+.vscode/
+.idea/
+
+# macOS & Linux cruft
+.DS_Store
+Thumbs.db 
