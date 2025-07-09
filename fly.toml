@@ -1,0 +1,32 @@
+# fly.toml — Fly.io configuration for FoodVision-V1
+
+app = "foodvision-v1"
+
+# Use the existing Dockerfile at the project root
+[build]
+  dockerfile = "Dockerfile"
+
+# Basic runtime environment
+[env]
+  PORT = "8000"
+
+# VM sizing: shared-cpu-2x = 2 vCPUs (well below the 8-CPU limit) and ~512 MB RAM
+[vm]
+  size = "shared-cpu-2x"
+  # You can optionally pin memory; omit to use the default for this size.
+  # memory = "1024"
+
+# Expose HTTP over 80/443 automatically (Fly default); internal app port is 8000
+[[services]]
+  internal_port = 8000
+  protocol      = "tcp"
+
+  [[services.ports]]
+    port = 80
+  [[services.ports]]
+    port     = 443
+    handlers = ["tls"]
+
+  [services.concurrency]
+    soft_limit = 20
+    hard_limit = 25 
